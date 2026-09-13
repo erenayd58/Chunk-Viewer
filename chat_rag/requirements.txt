@@ -1,0 +1,44 @@
+python-dotenv
+sentence-transformers
+
+# Relational persistence. PostgreSQL holds the knowledge bases, the ingest
+# ledger, the content identities and their analysis state, the ingest journal,
+# the gold set and -- since Step 9 -- the chunks and their embeddings
+# (storage/). psycopg 3 is the driver the application is written against and
+# the one config/database.py names explicitly, so a machine with psycopg2 lying
+# around cannot run it on a driver nobody tested. Alembic is how a schema is
+# created -- there is no metadata.create_all() in the source.
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
+alembic>=1.13
+# The vector column type and its distance operators, on both sides: the server
+# needs the `vector` extension (docker-compose uses pgvector/pgvector:pg16, and
+# 0002_pgvector_store creates it) and this is the SQLAlchemy binding for it.
+pgvector>=0.3
+# amsc-poc is the chunking library, consumed as a versioned dependency and
+# pinned to an immutable commit that must already be pushed. Every
+# `from amsc... import` in product code has to resolve at this revision;
+# tests/unit/test_amsc_pin.py checks that against the sibling checkout's
+# git history, so a stale pin fails the suite instead of the Docker build.
+amsc-poc @ git+https://github.com/erenayd58/chunk.git@f8409805a9cd9c5f1db771b2fdbf28d891c1c54b
+openai
+rank-bm25
+numpy
+ollama  # Official Ollama Python client
+
+# Document Parsing
+pymupdf  # PDF parsing
+pymupdf4llm[layout]==0.3.4  # layout-aware parsing, the structured PDF path
+python-docx  # DOCX parsing
+
+# Web Framework
+# The product contract (/api/v1) is a FastAPI application: typed request and
+# response models, one exception table, and an OpenAPI document generated from
+# them rather than maintained beside them. uvicorn is its host and the whole
+# server -- `python -m asgi`, one process with a bounded thread pool, the same
+# on Windows and Linux. Flask, flask-cors and waitress were the console's own
+# framework and its WSGI server; the console is a Next.js application over this
+# contract now (frontend/), and Step 13 removed all three.
+fastapi
+uvicorn
+python-multipart  # the multipart parser FastAPI needs for POST /api/v1/documents

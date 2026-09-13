@@ -1,0 +1,268 @@
+# Configuration — where a setting comes from and what wins
+
+For the developer who wants to change one number and not wonder which value
+the process actually used.
+
+## Precedence
+
+```
+  1. the real process environment      (a container, compose, CI, your shell)
+  2. .env                              (applied once, by config/__init__.py)
+  3. the application default           (the setting's own dataclass field)
+```
+
+**One exception, deliberate.** A *state path* — `STRUCTURED_PARSER_CACHE` —
+from `.env` is ignored once `CHAT_RAG_DATA_DIR` is set. `.env` describes a
+developer's local layout (`STRUCTURED_PARSER_CACHE=.cache/canonical-units`
+means "the cache in my checkout"), and a deployment or a smoke run that
+declared where its state lives must not have it moved back by a leftover file.
+That is how a smoke run once wrote into the developer's own checkout. Rule 1
+still applies: set the variable in the real environment and it wins, visibly.
+Refusals are reported at start-up (`! STRUCTURED_PARSER_CACHE=… ignored: …`).
+
+There used to be a second one, `VECTOR_DB_PATH`, and it was the reason this
+rule exists: a stale `.env` pointing at `./chroma_db` made a smoke run open
+the developer's real vector store. It is gone — the vectors are rows in the
+database `DATABASE_URL` names, and no path addresses them.
+
+`.env` is applied in `config/__init__.py`, before any config module reads
+anything, so import order cannot change what a setting resolves to. It is the
+only place in the application that reads a dotenv file, and a test asserts
+that.
+
+## The owners — six in `config/`, and one outside it
+
+| owner | what it decides | validation |
+|---|---|---|
+| [config/paths.py](../src/chat_rag/config/paths.py) | where every **file** this process writes goes, under `CHAT_RAG_DATA_DIR` | resolves; reports refusals |
+| [config/database.py](../src/chat_rag/config/database.py) | the relational store: `DATABASE_URL` and the connection pool | fail fast; unset is refused at the first use, by name |
+| [config/runtime.py](../src/chat_rag/config/runtime.py) | the server process: `FLASK_HOST`, `FLASK_PORT`, `WAITRESS_THREADS`, `WAITRESS_CHANNEL_TIMEOUT` (the names are the deployment's, kept when Flask and waitress went — see below) | fail fast |
+| [config/ingest.py](../src/chat_rag/config/ingest.py) | ingest workers, queue, deadlines, provider/embedding budgets, pipeline cache | fail fast |
+| [config/query.py](../src/chat_rag/config/query.py) | query admission, answer budget, deadlines | fail fast |
+| [config/settings.py](../src/chat_rag/config/settings.py) | everything else: models, endpoints, retrieval, chunking, parsing | fail fast on the strict ones |
+| [utils/logger.py](../src/chat_rag/utils/logger.py) | `LOG_LEVEL`, `LOG_FILE_LEVEL`, rotation | **fail safe** — see below |
+
+`Settings` holds the three limit objects and the path layout, and validates the
+combination when it is constructed, so an invalid value stops the process at
+start-up — when somebody is looking — rather than refusing the first upload.
+
+### Reading the environment is one step, not a habit
+
+Every owner above is the same shape: a frozen dataclass carrying the defaults,
+and one `*_from_env()` function that turns an environment into one.
+
+```python
+Settings.from_env()                      # what the product calls
+Settings(answer_provider="ollama", …)    # what a library caller can do instead
+```
+
+Constructing `Settings` reads nothing. That is what makes the engine usable
+without arranging a process environment first, and it is checked rather than
+claimed: `test_from_env_with_an_empty_environment_matches_the_dataclass_defaults`
+compares the two halves field by field, and
+`test_only_the_readers_and_the_named_exceptions_touch_the_environment` fails if
+anything in `src/chat_rag` reads `os.environ` outside a reader. Four reads are
+allowed and named there, and none of them is a setting's default: two provider
+**keys**, looked up at request time by the name a setting gave and never
+stored; `CHAT_RAG_GIT_SHA`, a build stamp; and `HF_HOME`, which belongs to
+huggingface.
+
+Two things the *process* decides, and neither happens on import any more:
+
+| call | what it does | who calls it |
+|---|---|---|
+| `chat_rag.process.apply_thread_defaults()` | `OMP_NUM_THREADS` and friends, before the numeric libraries are imported | `asgi.py`, `cli/__init__.py`, `tools/import_smoke.py`, the test session |
+| `chat_rag.utils.logger.configure_logging()` | installs the file and console handlers | `asgi.py`, `cli/__init__.py` |
+
+Importing `chat_rag` attaches a `logging.NullHandler` and does nothing else —
+no directory, no file, no environment write. `tests/unit/test_import_side_effects.py`
+imports the package in a fresh interpreter and checks exactly that.
+
+### Whose configuration is *current*
+
+`config/paths.py` publishes a module-level reader per directory —
+`paths.viewer_live_analysis()`, `paths.upload_staging()`,
+`paths.canonical_cache()` — and every writer in the application calls one.
+What they answer with depends on whether a call is inside an engine:
+
+```
+inside an activation   →  that engine's PathSettings   (runtime.active().paths)
+outside one            →  the process environment      (paths_from_env())
+```
+
+the same rule `storage.session_scope()`, `limits.provider_budget()` and
+`telemetry.metrics()` already follow. A **configured** engine — one given a
+`Settings`, which is what `chat_rag.api.Engine` always does — is exactly what
+it was configured with, so `EngineConfig(data_dir=…)` really separates two
+engines' files. An **environment-derived** engine — `build_services()` with no
+settings, which is what the product composes — reads the environment when
+asked, so no product path moved and a `CHAT_RAG_DATA_DIR` declared after
+start-up still takes effect.
+
+Two things stay outside that rule on purpose. Applying `.env` reads the
+environment's data root directly, because it happens while `config` is still
+being imported and before any engine exists. And `configure_logging()` is an
+entry point's call, so a data root does not relocate a running process's log
+file.
+
+### The groups, and what each is for
+
+| group | variables | what changing them does |
+|---|---|---|
+| **database** | `DATABASE_URL`, `DATABASE_POOL_SIZE`, `DATABASE_MAX_OVERFLOW`, `DATABASE_POOL_TIMEOUT`, `DATABASE_POOL_RECYCLE`, `DATABASE_CONNECT_TIMEOUT`, `DATABASE_ECHO` | where the relational records live and how many connections may reach them. `DATABASE_URL` has no default and cannot have one — see [database.md](database.md) |
+| **state** | `CHAT_RAG_DATA_DIR`, `STRUCTURED_PARSER_CACHE` | moves where every **file** the process persists lives. One directory covers all of them; the records and the vectors are not among them — they are in PostgreSQL |
+| **start-up** | `CHAT_RAG_MIGRATE_ON_START`, `CHAT_RAG_DB_WAIT` | whether the container brings the schema to head before it serves, and how long that step waits for a database that is up but still recovering. Read by `tools/migrate.py`, which the entrypoint runs — not by the application |
+| **the console** | `CHAT_RAG_API_URL` | where the Next.js console forwards `/api/v1`. Read per request by `frontend/lib/api/proxy.ts`, so one console image runs against any backend. It is the *only* setting the front end has |
+| **server** | `FLASK_HOST`, `FLASK_PORT`, `WAITRESS_THREADS`, `WAITRESS_CHANNEL_TIMEOUT` | the process itself. `WAITRESS_THREADS` is the number every other ration is sized against, and it sizes the worker pool the synchronous handlers run in |
+| **ingest limits** | `INGEST_WORKERS`, `INGEST_QUEUE_CAPACITY`, `INGEST_JOB_TIMEOUT`, `INGEST_SYNC_WAIT`, `INGEST_SYNC_WAITERS`, `INGEST_JOB_RETENTION` | how much uploading can happen at once and for how long |
+| **provider budgets** | `PROVIDER_MAX_INFLIGHT`, `DEEP_ANALYSIS_CONCURRENCY`, `EMBEDDING_MAX_INFLIGHT`, `ANSWER_MAX_INFLIGHT` | how many calls may be in flight to each external service. Three separate caps so no path can starve another |
+| **query limits** | `QUERY_MAX_ACTIVE`, `QUERY_TIMEOUT`, `ANSWER_SLOT_WAIT` | how many questions run at once, and for how long |
+| **caches** | `PIPELINE_CACHE_MAX`, `PIPELINE_CACHE_TTL` | the largest memory dial in the process |
+| **models** | `ANSWER_*`, `EMBEDDING_*`, `DEEP_ANALYSIS_*`, `OLLAMA_*`, `AZURE_*`, `LLM_PROVIDER` | which model answers, embeds and proposes boundaries, and through which gateway |
+| **retrieval and chunking** | `RETRIEVAL_PROFILE`, `CHUNKER_TYPE`, `DEFAULT_TOP_K`, `CONTEXT_*`, `VECTOR_DB_COLLECTION` | what gets indexed and what gets found. `VECTOR_DB_COLLECTION` names only the collection used when *no* knowledge base is selected; a knowledge base's collection is its own id |
+| **logging** | `LOG_LEVEL`, `LOG_FILE_LEVEL`, `LOG_MAX_BYTES`, `LOG_BACKUPS`, `LOG_RUNS_KEPT` | what is written and how much is kept. `LOG_FILE_LEVEL=DEBUG` writes document content to disk |
+
+The relationships that matter are in *Cross-setting rules* below; how each
+limit behaves under load is in [operations.md](operations.md).
+
+### Why logging validates differently
+
+Every numeric limit refuses to start on a bad value. Logging does not: an
+unrecognised level falls back to `INFO` and *says so* at start-up. The risky
+direction is `DEBUG` — the file handler writes prompts, retrieved chunks and
+answer context to a file that gets tailed, shipped and pasted into tickets — so
+a typo must never be what turns that on, and a logging typo must not take the
+service down either. That is the one place the categories diverge, and it is
+deliberate. The fallback used to be silent; now it is reported.
+
+## Defaults: one place each
+
+A default is written on the dataclass field and nowhere else. The env readers
+take the field, not a restated string:
+
+```python
+workers=_number(env, "INGEST_WORKERS", _DEFAULTS.workers, int)
+```
+
+`WAITRESS_THREADS` is the one every other ration is sized against
+(`INGEST_SYNC_WAITERS` defaults to half of it, `QUERY_MAX_ACTIVE` to
+`threads - sync_waiters - 1`). It has exactly one reader, `config/runtime.py`.
+Before, the server entrypoint, `config/ingest.py` and `config/query.py` each
+read it with the default `8` written out, and the entrypoint's parser silently
+forgave a bad value while the others did not — so `WAITRESS_THREADS=-4`
+produced a server with eight threads and limits sized against minus four.
+
+**The four server names outlived their frameworks.** Flask and waitress were
+removed in Step 13; `FLASK_HOST`, `FLASK_PORT`, `WAITRESS_THREADS` and
+`WAITRESS_CHANNEL_TIMEOUT` were not, because they are what every `.env`, the
+compose file and the container image already carry. Renaming a setting is a
+*silent* change: the old name stops being read and the default takes over. It
+is left to whoever decides to make it deliberately, with a migration note
+([legacy-removal.md](legacy-removal.md)).
+
+`INGEST_SYNC_WAIT` and `INGEST_SYNC_WAITERS` are in the same position for a
+different reason. They bound a synchronous upload, and no route makes one any
+more — `POST /api/v1/documents` always answers 202 with the job. The
+reservation is kept because it is subtracted from the `QUERY_MAX_ACTIVE`
+default: removing it would raise the number of questions a deployment answers
+at once, which is a change to what it does rather than a cleanup.
+
+## Cross-setting rules
+
+Checked once, in `config.runtime.cross_check`, so no rule is stated twice:
+
+| rule | outcome |
+|---|---|
+| `INGEST_SYNC_WAIT` < `WAITRESS_CHANNEL_TIMEOUT` | **refuses to start** — a synchronous upload would still be waiting when the server closes the connection it would answer on |
+| `QUERY_MAX_ACTIVE + INGEST_SYNC_WAITERS` < `WAITRESS_THREADS` | **warns** — an explicit ration that leaves no free thread has always been honoured and named rather than overruled |
+| `DEEP_ANALYSIS_CONCURRENCY` ≤ `PROVIDER_MAX_INFLIGHT` | **warns** — a job could never reach its own concurrency |
+
+Warnings appear in the start-up banner as `! …` lines and in
+`/api/ops/metrics` under `configuration.warnings`.
+
+## Docker vs local
+
+`.env.docker` is read by compose and is **not** the local `.env` (which points
+at `localhost`, meaning the container itself). Every value there is either a
+deliberate deployment override or a default restated for visibility, and
+`tests/unit/test_configuration.py` requires each *difference* from the code to
+be listed with a reason. The deliberate ones today:
+
+| setting | container value | why |
+|---|---|---|
+| `DATABASE_URL` | the `db` compose service | there is no application default and cannot be one; a real password belongs in `.env.docker.local` |
+| `LLM_PROVIDER` | `ollama` | the container talks to Ollama on the host, not Azure |
+| `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | reaches the host from inside a container |
+| `OLLAMA_MODEL` | `qwen2.5:3b` | the small model the demo image expects |
+
+That is the whole list — the four entries `DELIBERATE_OVERRIDES` in
+`tests/unit/test_configuration.py` declares. Everything else `.env.docker`
+writes out (`RETRIEVAL_PROFILE=bm25_only`, `WAITRESS_THREADS=8`,
+`LOG_LEVEL=INFO`, …) is the application default *restated for visibility*, and
+the same test fails if any of them stops matching the code.
+
+Two settings the stack needs are **structural** rather than configuration, and
+they live in `docker-compose.yml` instead of `.env.docker`: they name
+containers, so an operator changing them is changing the topology and not a
+preference.
+
+| setting | value | why it is not in an env file |
+|---|---|---|
+| `CHAT_RAG_DATA_DIR` | `/data` | it has to match the volume mount beside it, and a `.env` left over from local development must not be able to move it |
+| `CHAT_RAG_API_URL` | `http://app:5005` | it is the compose service name; there is no value for it that is right in two deployments |
+
+Secrets go in `.env.docker.local`, which is git-ignored and overrides
+`.env.docker`. The database password is the compose variable
+`POSTGRES_PASSWORD`, defaulting to `chat_rag` — which is a default and not a
+secret only because the database publishes no port: it is reachable from the
+other two containers and nowhere else.
+
+`env.example` works the same way: **commented-out lines show the application
+default**; uncommented lines are the demo profile, which deliberately differs
+because the defaults are the conservative no-provider ones. Both halves are
+held to the code by the same test, so neither file can quietly become the
+source of truth, and neither may document a setting no code reads (it used to
+offer circuit breakers, retries, rate limits and a cache that nothing has ever
+read).
+
+## Secrets
+
+Keys are configuration, never defaults or source constants. Most of this
+application configures the *name* of the variable holding a key
+(`ANSWER_API_KEY_ENV`, `EMBEDDING_API_KEY_ENV`, `DEEP_ANALYSIS_API_KEY_ENV`);
+the key itself is read at request time and never stored, logged or serialised.
+
+`Settings.to_dict()` redacts everything named in `SECRET_ATTRIBUTES`, and
+`Settings.effective_configuration()` — what the banner and `/api/ops/metrics`
+print — carries no credential by construction. A test asserts a planted key
+appears in neither.
+
+## Diagnostics
+
+`Settings.effective_configuration()` is the one answer to "what is this
+instance running with". The start-up banner prints it and
+`/api/ops/metrics` returns it under `configuration`; they cannot disagree.
+It carries the data root, the resolved store and cache paths, the runtime /
+ingest / query limits, the configured models and key-variable *names*, the
+logging setup, and any warnings. It is not an environment dump.
+
+## Adding a setting
+
+1. Decide the owner from the table above.
+2. Add the field to that module's dataclass **with its default** (or, for
+   `Settings`, one `os.getenv` call), and read it with `_number` / `_text`.
+3. Add its rule to that dataclass's `validate()`. If the rule involves another
+   group, put it in `cross_check` instead — not in both.
+4. Document it in `env.example`, commented out, showing the default. If the
+   demo profile or the container needs a different value, add the line **and**
+   its reason to `DELIBERATE_OVERRIDES` in
+   `tests/unit/test_configuration.py`.
+5. If an operator would need to see it while debugging, add it to
+   `effective_configuration()` — never a credential.
+
+**A setting that is read must be applied.** `test_every_setting_read_is_a_setting_applied`
+walks every attribute `Settings.__init__` assigns and fails unless shipping
+code reads it; a test reading it does not count. This is the guard that found
+twelve knobs (`LOG_TOKEN_USAGE`, `PDF_PARSER_BACKEND`, `OCR_LANGUAGE`,
+`LLM_MAX_TOKENS`, …) which were read into attributes nothing ever looked at.
+A knob that turns nothing is worse than no knob, so wire it or do not add it.

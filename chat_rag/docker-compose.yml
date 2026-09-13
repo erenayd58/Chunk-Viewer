@@ -1,0 +1,228 @@
+# The whole system, from a clean machine:
+#
+#     docker compose up --build
+#
+# Three services and nothing else. `db` is PostgreSQL with pgvector, `app` is
+# the FastAPI application, `frontend` is the Next.js console. No queue and no
+# model server: Ollama stays on the host, and everything else this application
+# needs still runs in-process.
+#
+# The database is where the knowledge bases, the ingest ledger, the content
+# identities and their analysis state, the ingest journal, the gold set and --
+# since Step 9 -- the chunks and their embeddings live. It runs the pgvector
+# image because of that last pair: the migration creates the `vector`
+# extension, and a stock postgres image cannot. The parser cache, the packaged
+# Viewer artifacts and the logs are still files under the mounted directory.
+#
+# **The schema is applied at start-up, and it is still a migration.** `app`
+# runs `tools/migrate.py` before the server: it waits for a database that is
+# accepting connections but still recovering, takes an advisory lock so two
+# containers cannot migrate at once, and logs the revision it moved from and
+# to. Nothing in the application creates a table. Set
+# CHAT_RAG_MIGRATE_ON_START=0 to apply the schema as a separate reviewed step
+# instead.
+#
+# **What is published, and what is not.** The console is on :3000 and is where
+# a browser goes; the application is on :5005 because the contract and the
+# operator's `/api/ops/metrics` are consumed from outside this stack -- by a
+# dashboard, by `curl`, by the live suite -- and hiding them would be a change
+# to that, not hardening. The database has no published port at all, which is
+# what lets its password be a local default rather than a secret.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: chat_rag
+      POSTGRES_DB: chat_rag
+      # Not published, so this guards a port only the two containers above can
+      # reach. Override it -- here, or in a `.env` beside this file, which
+      # compose reads and git ignores -- for any deployment where that is not
+      # true, and set the matching DATABASE_URL in .env.docker.local.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chat_rag}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` answers before recovery finishes, which is why the
+      # application waits again on its own rather than trusting this alone.
+      test: ["CMD-SHELL", "pg_isready -U chat_rag -d chat_rag"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      args:
+        # Stamps the commit into the image so `cli report` can name it.
+        # Optional: unset, the manifest honestly reports it as unknown.
+        CHAT_RAG_GIT_SHA: ${CHAT_RAG_GIT_SHA:-}
+    # The tag is a variable so a second stack -- the reproducibility gate
+    # brings one up from a clean clone -- cannot overwrite the image this
+    # checkout built. Unset, it is the name it has always been.
+    image: ${CHAT_RAG_IMAGE:-chat-rag:local}
+    ports:
+      # The contract and the operator surface, for anything outside this stack.
+      # The console does not use this: it reaches the application over the
+      # compose network, by service name.
+      #
+      # Only the *published* half moves. Inside the network the application is
+      # always :5005, which is what CHAT_RAG_API_URL below says -- so a second
+      # stack can be brought up beside this one (the reproducibility gate does
+      # exactly that) without either of them having to be told a new address.
+      - "${CHAT_RAG_PORT:-5005}:5005"
+
+    env_file:
+      # Tracked defaults, then optional private overrides. Later files win, so
+      # .env.docker.local can replace anything above without being tracked.
+      - path: .env.docker
+        required: true
+      - path: .env.docker.local
+        required: false
+
+    environment:
+      # Structural, not configuration: this says where the container's *files*
+      # live, and must match the mount below. It is the only path this
+      # deployment sets -- the parser's canonical-unit cache, the packaged
+      # Viewer artifacts, the embedding caches, the uploads and the logs are
+      # all derived from it, and a .env left over from local development can
+      # no longer override any of them. The records and the vectors are not
+      # files at all; DATABASE_URL says where they are.
+      CHAT_RAG_DATA_DIR: /data
+
+    volumes:
+      # Every *file* the application persists -- the parser's canonical-unit
+      # cache, the packaged Viewer artifacts, the embedding caches, the
+      # uploads and the logs -- lives under one directory, so a rebuilt
+      # container finds them where it left them. The records and the vectors
+      # are in the database volume above.
+      - app-data:/data
+      # Evaluation output written by `python -m cli`. Mounted per
+      # subdirectory so artifacts/gold/ keeps coming from the image, where
+      # frozen gold sets are read-only inputs rather than runtime state.
+      - eval-runs:/app/artifacts/runs
+      - eval-reports:/app/artifacts/reports
+
+    depends_on:
+      db:
+        # Not merely started: the application refuses to serve without a
+        # reachable database, so starting it against a server still replaying
+        # its write-ahead log would be a container that exits and restarts
+        # until the database happens to be up. The migration step waits again
+        # on top of this, because healthy and ready are not the same instant.
+        condition: service_healthy
+
+    extra_hosts:
+      # Docker Desktop provides this name already; declaring it means the same
+      # OLLAMA_BASE_URL also works on plain Linux Docker.
+      - "host.docker.internal:host-gateway"
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5005/api/v1/health', timeout=4).status == 200 else 1)
+      interval: 30s
+      timeout: 5s
+      # Building the pipeline and reading an existing store takes a moment on
+      # first boot; the container is not called unhealthy while that happens.
+      start_period: 60s
+      retries: 3
+
+    # The default SIGTERM is enough: the entrypoint `exec`s uvicorn, so the
+    # signal reaches the server itself, which stops accepting, runs the
+    # lifespan's shutdown -- draining the ingest jobs already running and
+    # returning the database pool -- and exits 0 rather than being killed at
+    # the end of the grace period.
+    stop_grace_period: 15s
+
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: ${CHAT_RAG_CONSOLE_IMAGE:-chat-rag-console:local}
+    ports:
+      # Where a browser goes: http://localhost:3000. Every screen is here,
+      # including /viewer.
+      - "${CHAT_RAG_CONSOLE_PORT:-3000}:3000"
+
+    environment:
+      # Where the application is, read by `lib/api/proxy.ts` on every request.
+      # `app` is the service name above, which is also its hostname on this
+      # network. Structural, like CHAT_RAG_DATA_DIR: it names a container, not
+      # a preference, so it lives here and not in .env.docker.
+      #
+      # This is a *runtime* setting, and it took a bug to make it one. It was a
+      # `rewrites()` entry in next.config.mjs, which Next.js resolves during
+      # `next build` and freezes into the build output -- so the image carried
+      # `http://127.0.0.1:5005`, which inside this container is this container,
+      # and every screen failed against an application that was healthy one hop
+      # away.
+      CHAT_RAG_API_URL: http://app:5005
+
+    depends_on:
+      app:
+        # Not `service_started`: the console's first screen lists knowledge
+        # bases, so a console that is up before the application is a console
+        # whose first paint is an error. Waiting for the application's health
+        # check also means waiting for the migration in front of it.
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          require('http').get({host:'127.0.0.1',port:3000,path:'/',timeout:4000},
+          r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # Next.js stops on SIGTERM; there is no in-flight work of its own to drain,
+    # only the requests it is forwarding.
+    stop_grace_period: 10s
+
+    restart: unless-stopped
+
+# Docker-managed volumes, not host directories, and the difference is not a
+# preference.
+#
+# These were `./.docker-data/...` bind mounts. On Docker Desktop that works,
+# because its filesystem translation layer presents a bind mount as owned by
+# whoever is asking. On Linux -- a CI runner, a server, anywhere this would
+# actually be deployed -- Docker creates a missing bind-mount source as
+# root:root and the mount carries that ownership into the container. The
+# application image drops to uid 10001 before it runs anything, so the first
+# thing it did was
+#
+#     PermissionError: [Errno 13] Permission denied: '/data/logs'
+#
+# and the container never served. The same was true, unnoticed, of the two
+# evaluation output mounts: `python -m cli report` could not write its report.
+# Only the database escaped it, because the postgres image starts as root and
+# fixes its own data directory before stepping down.
+#
+# A named volume is initialised from the image's content at the mount point,
+# ownership included, so /data arrives owned by the user that has to write it
+# -- on every platform, with nothing to remember and no chmod anywhere. The
+# Dockerfile creates all three paths for that reason.
+#
+# What this costs: the state is no longer a directory in the checkout. It is
+# read with `docker compose exec`, copied out with `docker compose cp`, and
+# reset with `docker compose down -v` -- one command for all of it, where
+# before it was `down` plus removing a directory. An existing `.docker-data/`
+# is not migrated and not read; it is the previous layout's, and can be
+# deleted.
+volumes:
+  db-data:
+  app-data:
+  eval-runs:
+  eval-reports:

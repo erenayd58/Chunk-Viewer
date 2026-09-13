@@ -1,0 +1,54 @@
+# Runtime state belongs in a volume, never in an image layer. .docker-data/ is
+# the directory the stack used before those became named volumes; a checkout
+# that still has one must not bake it in.
+.docker-data/
+chroma_db/
+.cache/
+logs/
+.pytest-tmp/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Local runtime state: the container starts with its own, empty copies.
+.knowledge_bases.json
+.ingested_documents.json
+.gold_set.json
+*.bak
+*.json.*.bak
+*.json.corrupt-*
+
+# Secrets. The compose file supplies configuration through env_file instead.
+.env
+.env.*
+!.env.docker
+
+# Generated evaluation output. artifacts/gold/ is deliberately not excluded:
+# frozen gold sets are inputs and travel with the image, read-only.
+artifacts/runs/
+artifacts/reports/
+
+# Not needed to run the application.
+.git/
+.gitignore
+.vscode/
+.idea/
+documents/
+
+# Local virtual environments must never enter an image layer.
+venv/
+.venv/
+
+# The console is its own image, built from frontend/Dockerfile. Nothing this
+# application serves comes from that directory -- it speaks /api/v1 and serves
+# no page -- and copying it in would put a host-built node_modules (the wrong
+# platform's binaries) and a .next nobody can reproduce into this layer.
+frontend/
+
+# The suite does not run in the image, and its fixtures include frozen corpora
+# that exist to be compared against, never to be served. The documentation
+# stays: start-up and refusal messages name docs/ files, and a container whose
+# error tells you to read a file it does not have is worse than one that says
+# nothing.
+tests/
+.github/

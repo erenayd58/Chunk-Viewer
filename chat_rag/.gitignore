@@ -1,0 +1,136 @@
+# Python. Anchored to the repository root on purpose: an unanchored `lib/`
+# matches at every depth, and `frontend/lib/` -- the console's API layer -- is
+# source that has to be committed.
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Environment variables. .env holds whichever provider keys this machine
+# uses; env.example is the tracked template and .env.docker the tracked,
+# secret-free container configuration.
+.env
+
+# Vector stores that are no longer the product's. The vectors are rows in
+# PostgreSQL since Step 9, and neither of these directories is written any
+# more -- but a working checkout still carries the one Chroma left behind
+# (that is what tools/migrate_chroma_to_pgvector.py reads), and it must not be
+# committed. FAISS was once tracked: one knowledge base's index and its
+# meta.json -- which carries the full text of every chunk in it -- travelled
+# in every clone, and a clone arriving with a populated vector store lets a
+# clean-clone check pass for the wrong reason.
+chroma_db/
+faiss_db/
+
+# Document tracking. A .corrupt-<timestamp> copy is what the tracker keeps
+# when it finds a ledger it cannot parse, so the records stay recoverable;
+# it is runtime state like the ledger itself.
+.ingested_documents.json
+# Ingest job records: what a restart answers a client's job_id from. Runtime
+# state, per process, pruned on INGEST_JOB_RETENTION.
+.ingest-jobs/
+# Uploaded files waiting for their ingest job; swept at start-up.
+chat_rag-uploads/
+*.json.corrupt-*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Test output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# NLTK data (downloaded at runtime)
+nltk_data/
+logs/*
+chroma_db/
+faiss_db/*
+documents/*
+archive/*
+docs/*
+# ...except the handover package. docs/ is otherwise scratch and generated
+# output, so it is ignored by default and each document the README links to is
+# named here -- a doc that does not travel with a clone is worse than no doc.
+!docs/api-v1.md
+!docs/architecture.md
+!docs/configuration.md
+!docs/database.md
+!docs/legacy-removal.md
+!docs/library-api.md
+!docs/limitations.md
+!docs/operations.md
+!docs/testing.md
+# Regenerable caches: canonical units from the structured PDF parser,
+# plus the embedding caches used by the comparison profiles.
+.cache/
+*.bak
+
+# Runtime gold set: whatever the reviewer has marked in the UI so far. It is
+# mutable working state, not a regression set -- freeze one with
+# `python -m cli gold export` into artifacts/gold/ and commit that instead.
+.gold_set.json
+
+# Evaluation runs and QA report packages are regenerable from production
+# state, and a report carries the whole exported corpus. Frozen gold sets
+# under artifacts/gold/ are not regenerable, so they stay tracked.
+artifacts/runs/
+artifacts/reports/
+
+# Viewer analyses of this console's own documents: one directory per
+# ingested document, rebuilt from that ingest whenever it is missing. Live
+# workspace state, never a frozen benchmark artifact.
+artifacts/viewer-live/
+
+# The container's state was a directory here until it became Docker-managed
+# named volumes (docker-compose.yml says why: a bind mount is root-owned on
+# Linux and the app runs as uid 10001). Nothing writes this any more; the entry
+# stays so a checkout that predates the change cannot commit what it left.
+.docker-data/
+
+# Private container configuration; .env.docker holds the tracked, secret-free
+# defaults.
+.env.docker.local
+
+# Knowledge base records: runtime state written by the application, not
+# configuration. Committing it publishes whichever knowledge bases happen to
+# exist on one machine; the file is recreated on demand when absent.
+.knowledge_bases.json
+
+# Demo launcher runtime state: logs and the process ids start-demo.ps1
+# started (stop-demo.ps1 reads them). Local, regenerable, never committed.
+.demo/

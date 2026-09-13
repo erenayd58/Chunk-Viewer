@@ -1,0 +1,16 @@
+.cache/
+artifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+kkbfaaliyetraporu2024.pdf
+.pytest-tmp/
+.tmp/
+data/raw/*.pdf
+logs/
+
+# setuptools build output
+build/
+*.egg-info/
